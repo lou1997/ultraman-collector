@@ -3,6 +3,21 @@
 
 const WORKER_URL = process.env.WORKER_URL || 'https://ultraman.shiyijin.dpdns.org';
 const INTERVAL = parseInt(process.env.INTERVAL) || 5 * 60 * 1000; // 默认5分钟
+let collectCount = 0;
+let timer = null;
+
+// 优雅退出
+process.on('SIGTERM', () => {
+  console.log(`[Exit] Received SIGTERM after ${collectCount} collections. Cleaning up...`);
+  if (timer) clearInterval(timer);
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log(`[Exit] Received SIGINT after ${collectCount} collections. Cleaning up...`);
+  if (timer) clearInterval(timer);
+  process.exit(0);
+});
 
 // 从B站获取投票数据
 async function fetchVoteData() {
@@ -12,48 +27,70 @@ async function fetchVoteData() {
 
   console.log(`[Fetcher] Fetching from Bilibili...`);
 
-  const response = await fetch(apiUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Referer': 'https://www.bilibili.com/blackboard/era/yPzdu1cQxeYNK7dd.html',
-      'Origin': 'https://www.bilibili.com',
-      'Accept': 'application/json, text/plain, */*',
-    },
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000); // 15秒超时
 
-  const data = await response.json();
+  try {
+    const response = await fetch(apiUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://www.bilibili.com/blackboard/era/yPzdu1cQxeYNK7dd.html',
+        'Origin': 'https://www.bilibili.com',
+        'Accept': 'application/json, text/plain, */*',
+      },
+    });
 
-  if (data.code !== 0 || !data.data?.items) {
-    console.error(`[Fetcher] API error:`, data.message);
-    return [];
-  }
+    clearTimeout(timeout);
 
-  const votes = {};
-  for (const item of data.data.items) {
-    const name = item.item?.title;
-    const count = item.vote || 0;
-    if (name) {
-      votes[name] = count;
+    const data = await response.json();
+
+    if (data.code !== 0 || !data.data?.items) {
+      console.error(`[Fetcher] API error:`, data.message);
+      return [];
     }
-  }
 
-  console.log(`[Fetcher] Got ${Object.keys(votes).length} characters`);
-  return votes;
+    const votes = {};
+    for (const item of data.data.items) {
+      const name = item.item?.title;
+      const count = item.vote || 0;
+      if (name) {
+        votes[name] = count;
+      }
+    }
+
+    console.log(`[Fetcher] Got ${Object.keys(votes).length} characters`);
+    return votes;
+  } catch (error) {
+    clearTimeout(timeout);
+    throw error;
+  }
 }
 
 // 发送数据给 Cloudflare Worker
 async function sendToWorker(votes) {
   console.log(`[Sender] Sending ${Object.keys(votes).length} votes to worker...`);
 
-  const response = await fetch(`${WORKER_URL}/api/input`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ votes })
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000); // 15秒超时
 
-  const result = await response.json();
-  console.log(`[Sender] Response:`, result);
-  return result;
+  try {
+    const response = await fetch(`${WORKER_URL}/api/input`, {
+      signal: controller.signal,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ votes })
+    });
+
+    clearTimeout(timeout);
+
+    const result = await response.json();
+    console.log(`[Sender] Response:`, result);
+    return result;
+  } catch (error) {
+    clearTimeout(timeout);
+    throw error;
+  }
 }
 
 // 主循环
@@ -61,16 +98,19 @@ async function main() {
   console.log('=== Ultraman Vote Collector ===');
   console.log(`Worker URL: ${WORKER_URL}`);
   console.log(`Interval: ${INTERVAL / 1000} seconds`);
+  console.log(`Started at: ${new Date().toISOString()}`);
   console.log('');
 
   async function collect() {
+    collectCount++;
     try {
       const votes = await fetchVoteData();
       if (Object.keys(votes).length > 0) {
         await sendToWorker(votes);
       }
+      console.log(`[OK] Collection #${collectCount} completed at ${new Date().toISOString()}`);
     } catch (error) {
-      console.error('[Error]', error.message);
+      console.error(`[Error] Collection #${collectCount} failed:`, error.message);
     }
   }
 
@@ -78,7 +118,7 @@ async function main() {
   await collect();
 
   // 定时执行
-  setInterval(collect, INTERVAL);
+  timer = setInterval(collect, INTERVAL);
 }
 
 main();
