@@ -1,0 +1,10 @@
+{
+  "name": "ultraman-hf-collector",
+  "version": "1.0.0",
+  "description": "Ultraman vote collector for Hugging Face",
+  "main": "hf-collector.js",
+  "scripts": {
+    "start": "node hf-collector.js"
+  },
+  "dependencies": {}
+}
