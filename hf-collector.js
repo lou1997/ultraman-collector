@@ -1,22 +1,46 @@
 // Hugging Face Docker 用的采集服务
 // 职责：从 B站 采集数据，发送给 Cloudflare Worker 存储
 
+const http = require('http');
 const WORKER_URL = process.env.WORKER_URL || 'https://ultraman.shiyijin.dpdns.org';
 const INTERVAL = parseInt(process.env.INTERVAL) || 5 * 60 * 1000; // 默认5分钟
+const PORT = process.env.PORT || 7860;
 let collectCount = 0;
 let timer = null;
+
+// 简单的 HTTP 服务器（响应健康检查）
+const server = http.createServer((req, res) => {
+  if (req.url === '/health' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      collections: collectCount,
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
+    }));
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`[Server] Health check server running on port ${PORT}`);
+});
 
 // 优雅退出
 process.on('SIGTERM', () => {
   console.log(`[Exit] Received SIGTERM after ${collectCount} collections. Cleaning up...`);
   if (timer) clearInterval(timer);
-  process.exit(0);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000); // 5秒后强制退出
 });
 
 process.on('SIGINT', () => {
   console.log(`[Exit] Received SIGINT after ${collectCount} collections. Cleaning up...`);
   if (timer) clearInterval(timer);
-  process.exit(0);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000);
 });
 
 // 从B站获取投票数据
