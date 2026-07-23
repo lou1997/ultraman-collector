@@ -1,12 +1,52 @@
 // Hugging Face Docker 用的采集服务
-// 职责：从 B站 采集数据，发送给 Cloudflare Worker 存储
+// 职责：从 B站 采集数据，直接写入 Turso 数据库
 
 const http = require('http');
-const WORKER_URL = process.env.WORKER_URL || 'https://ultraman.shiyijin.dpdns.org';
+const { createClient } = require('@libsql/client');
+
+const TURSO_URL = process.env.TURSO_URL || 'libsql://ultraman-votes-shiyijin.aws-ap-northeast-1.turso.io';
+const TURSO_TOKEN = process.env.TURSO_TOKEN || '';
 const INTERVAL = parseInt(process.env.INTERVAL) || 5 * 60 * 1000; // 默认5分钟
 const PORT = process.env.PORT || 7860;
 let collectCount = 0;
 let timer = null;
+
+// Turso 客户端
+const turso = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN });
+
+// 初始化数据库表
+async function initDB() {
+  await turso.execute(`
+    CREATE TABLE IF NOT EXISTS characters (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      display_name TEXT NOT NULL,
+      avatar_url TEXT,
+      is_active INTEGER DEFAULT 1
+    )
+  `);
+  await turso.execute(`
+    CREATE TABLE IF NOT EXISTS vote_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      collected_at TEXT NOT NULL DEFAULT (datetime('now')),
+      character_name TEXT NOT NULL,
+      vote_count INTEGER NOT NULL DEFAULT 0,
+      source TEXT DEFAULT 'bilibili'
+    )
+  `);
+  await turso.execute(`
+    CREATE TABLE IF NOT EXISTS vote_hourly_summary (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      character_name TEXT NOT NULL,
+      hour_timestamp TEXT NOT NULL DEFAULT '',
+      vote_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(character_name, hour_timestamp)
+    )
+  `);
+  await turso.execute(`CREATE INDEX IF NOT EXISTS idx_hourly_char_time ON vote_hourly_summary(character_name, hour_timestamp)`);
+  console.log('[DB] Tables initialized');
+}
 
 // 简单的 HTTP 服务器（响应健康检查）
 const server = http.createServer((req, res) => {
@@ -33,7 +73,7 @@ process.on('SIGTERM', () => {
   console.log(`[Exit] Received SIGTERM after ${collectCount} collections. Cleaning up...`);
   if (timer) clearInterval(timer);
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 5000); // 5秒后强制退出
+  setTimeout(() => process.exit(0), 5000);
 });
 
 process.on('SIGINT', () => {
@@ -52,7 +92,7 @@ async function fetchVoteData() {
   console.log(`[Fetcher] Fetching from Bilibili...`);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000); // 15秒超时
+  const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
     const response = await fetch(apiUrl, {
@@ -91,46 +131,54 @@ async function fetchVoteData() {
   }
 }
 
-// 发送数据给 Cloudflare Worker
-async function sendToWorker(votes) {
-  console.log(`[Sender] Sending ${Object.keys(votes).length} votes to worker...`);
+// 写入 Turso 数据库
+async function saveToTurso(votes) {
+  const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const statements = [];
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000); // 15秒超时
-
-  try {
-    const response = await fetch(`${WORKER_URL}/api/input`, {
-      signal: controller.signal,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ votes })
+  for (const [name, count] of Object.entries(votes)) {
+    // 确保角色存在
+    statements.push({
+      sql: `INSERT OR IGNORE INTO characters (name, display_name) VALUES (?, ?)`,
+      args: [name, name]
     });
 
-    clearTimeout(timeout);
+    // 插入投票快照
+    statements.push({
+      sql: `INSERT INTO vote_snapshots (collected_at, character_name, vote_count, source) VALUES (?, ?, ?, 'bilibili')`,
+      args: [now, name, count]
+    });
 
-    const result = await response.json();
-    console.log(`[Sender] Response:`, result);
-    return result;
-  } catch (error) {
-    clearTimeout(timeout);
-    throw error;
+    // 更新小时汇总
+    const hourTimestamp = now.slice(0, 13) + ':00:00';
+    statements.push({
+      sql: `INSERT INTO vote_hourly_summary (character_name, hour_timestamp, vote_count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(character_name, hour_timestamp) DO UPDATE SET vote_count = ?`,
+      args: [name, hourTimestamp, count, count]
+    });
   }
+
+  await turso.batch(statements);
 }
 
 // 主循环
 async function main() {
   console.log('=== Ultraman Vote Collector ===');
-  console.log(`Worker URL: ${WORKER_URL}`);
+  console.log(`Turso URL: ${TURSO_URL}`);
   console.log(`Interval: ${INTERVAL / 1000} seconds`);
   console.log(`Started at: ${new Date().toISOString()}`);
   console.log('');
+
+  await initDB();
 
   async function collect() {
     collectCount++;
     try {
       const votes = await fetchVoteData();
       if (Object.keys(votes).length > 0) {
-        await sendToWorker(votes);
+        await saveToTurso(votes);
+        console.log(`[OK] Saved ${Object.keys(votes).length} characters to Turso`);
       }
       console.log(`[OK] Collection #${collectCount} completed at ${new Date().toISOString()}`);
     } catch (error) {

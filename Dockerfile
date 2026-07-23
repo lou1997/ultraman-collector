@@ -1,7 +1,10 @@
-FROM python:3.11-alpine
+FROM node:20-alpine
 
 WORKDIR /app
 
-COPY app.py .
+COPY package*.json ./
+RUN npm ci --omit=dev
 
-CMD ["python", "app.py"]
+COPY hf-collector.js .
+
+CMD ["node", "hf-collector.js"]
